@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import base64
 import hashlib
 import argparse
 import urllib.request
@@ -252,6 +253,115 @@ def detect_protocols(repo: dict) -> list[str]:
     return protocols
 
 
+def fetch_readme_params(owner: str, repo: str) -> list[dict]:
+    """
+    Fetch README and extract parameter definitions.
+    Returns list of {"name", "type", "description", "required"} dicts (max 20).
+    """
+    data = gh_request(f"/repos/{owner}/{repo}/readme")
+    content_b64 = data.get("content", "")
+    if not content_b64:
+        return []
+
+    try:
+        readme = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    params: list[dict] = []
+    seen: set[str] = set()
+
+    def add_param(name: str, ptype: str, desc: str, required: bool) -> None:
+        key = name.lower().strip()
+        if not key or key in seen or len(params) >= 20:
+            return
+        # Skip generic/noise tokens
+        noise = {"name", "type", "description", "required", "default", "example", "value", "option"}
+        if key in noise or len(key) < 2 or len(key) > 60:
+            return
+        seen.add(key)
+        params.append({
+            "name": name.strip(),
+            "type": ptype or "string",
+            "description": desc.strip()[:200],
+            "required": required,
+        })
+
+    # ── Strategy 1: Markdown parameter/config tables ──────────────────────
+    # Matches tables whose header contains param-like words
+    PARAM_HEADERS = re.compile(
+        r"param|argument|arg|option|flag|env|variable|input|field|key|prop",
+        re.IGNORECASE,
+    )
+    # Find all markdown tables (header row + separator + data rows)
+    table_re = re.compile(
+        r"(\|[^\n]+\|)\n\|[-| :]+\|\n((?:\|[^\n]+\|\n?)+)",
+        re.MULTILINE,
+    )
+    for table_match in table_re.finditer(readme):
+        header_row = table_match.group(1)
+        if not PARAM_HEADERS.search(header_row):
+            continue
+        # Parse header columns
+        cols = [c.strip().lower() for c in header_row.strip("|").split("|")]
+        # Map column indices
+        name_idx = next((i for i, c in enumerate(cols) if c in ("name", "param", "parameter", "argument", "arg", "option", "field", "key", "property")), 0)
+        type_idx = next((i for i, c in enumerate(cols) if "type" in c), -1)
+        desc_idx = next((i for i, c in enumerate(cols) if any(w in c for w in ("desc", "detail", "about", "info", "explain"))), -1)
+        req_idx  = next((i for i, c in enumerate(cols) if "req" in c or "mandator" in c or "optional" in c), -1)
+
+        for data_row in table_match.group(2).strip().splitlines():
+            cells = [c.strip() for c in data_row.strip("|").split("|")]
+            if len(cells) <= name_idx:
+                continue
+            raw_name = re.sub(r"[`*_\[\]()]", "", cells[name_idx]).strip()
+            if not raw_name:
+                continue
+            ptype = cells[type_idx].strip("`* ") if type_idx >= 0 and type_idx < len(cells) else "string"
+            desc  = re.sub(r"<[^>]+>", "", cells[desc_idx]) if desc_idx >= 0 and desc_idx < len(cells) else ""
+            req_cell = cells[req_idx].lower() if req_idx >= 0 and req_idx < len(cells) else ""
+            required = any(w in req_cell for w in ("yes", "true", "required", "✓", "✔"))
+            add_param(raw_name, ptype or "string", desc, required)
+
+    # ── Strategy 2: ENV variable bullet lists ────────────────────────────
+    # Matches: - `ENV_NAME` or - ENV_NAME: description  (or **)
+    env_re = re.compile(
+        r"[-*]\s+[`*]{0,2}([A-Z][A-Z0-9_]{2,})[`*]{0,2}\s*[:\-–]\s*(.{5,150})",
+        re.MULTILINE,
+    )
+    for m in env_re.finditer(readme):
+        name = m.group(1)
+        desc = m.group(2).strip().rstrip(".")
+        required = any(w in desc.lower() for w in ("required", "must", "mandatory"))
+        add_param(name, "string", desc, required)
+
+    # ── Strategy 3: JSON schema "properties" blocks ───────────────────────
+    json_block_re = re.compile(r"```(?:json|jsonc)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+    for m in json_block_re.finditer(readme):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        props = obj.get("properties") or (obj.get("input_schema") or {}).get("properties") or {}
+        required_list = obj.get("required", [])
+        for pname, pdef in props.items():
+            if not isinstance(pdef, dict):
+                continue
+            ptype = pdef.get("type", "string")
+            desc  = pdef.get("description", "")
+            add_param(pname, ptype, desc, pname in required_list)
+
+    # ── Strategy 4: --flag style parameter listings ───────────────────────
+    flag_re = re.compile(
+        r"--([a-z][a-z0-9_-]{1,30})\s+[<\[`]?([a-z_]+)[>\]`]?\s+[:\-–]\s+(.{5,120})",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for m in flag_re.finditer(readme):
+        add_param(m.group(1), m.group(2).lower(), m.group(3).strip(), False)
+
+    return params
+
+
 def repo_to_skill(repo: dict) -> dict:
     """Convert a GitHub repo object to ServAgent Tool schema."""
     owner = repo["owner"]["login"]
@@ -277,7 +387,7 @@ def repo_to_skill(repo: dict) -> dict:
             "url": html_url,
             "verified": False,
         },
-        "parameters": [],  # populated later by deeper analysis
+        "parameters": fetch_readme_params(owner, name) if stars >= 20 else [],
         "pricing": {"model": "free"},
         "endpoints": {
             "base": homepage or html_url,
