@@ -1,0 +1,74 @@
+name: Test Crawler
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Lint & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python3 -m py_compile scripts/skill_crawler.py && echo "✓ No syntax errors"
+
+      - name: Smoke test — score a sample
+        run: |
+          python3 - <<'EOF'
+          import json, sys, os
+          sys.path.insert(0, 'scripts')
+
+          # Minimal fake repo data to test scoring
+          sample = [
+            {
+              "id": "test/mcp-sample",
+              "name": "mcp-sample",
+              "description": "A sample MCP server for testing",
+              "category": "mcp",
+              "protocols": ["mcp"],
+              "source": "github",
+              "github": {"url": "https://github.com/test/mcp-sample", "stars": 100, "owner": "test", "repo": "mcp-sample", "license": "MIT"},
+            }
+          ]
+
+          # Write sample
+          json.dump(sample, open('/tmp/test-raw.json', 'w'))
+
+          # Run score subcommand
+          import subprocess
+          r = subprocess.run(
+            ['python3', 'scripts/skill_crawler.py', 'score',
+             '--input', '/tmp/test-raw.json',
+             '--output', '/tmp/test-scored.json'],
+            capture_output=True, text=True
+          )
+          print(r.stdout)
+          if r.returncode != 0:
+            print(r.stderr)
+            sys.exit(1)
+
+          result = json.load(open('/tmp/test-scored.json'))
+          print(f"✓ Score output: {len(result)} skills")
+          EOF
+
+      - name: Validate output schema
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          data = json.load(open('/tmp/test-scored.json'))
+          required = ['id', 'name', 'description', 'category']
+          for skill in data:
+              for f in required:
+                  if not skill.get(f):
+                      print(f"✗ Missing field '{f}' in skill: {skill.get('id')}")
+                      sys.exit(1)
+          print(f"✓ Schema valid for {len(data)} skills")
+          EOF
