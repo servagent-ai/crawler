@@ -1,122 +1,158 @@
-name: Crawl → PR to skills-data
+name: Crawl Skills
 
 on:
   schedule:
-    - cron: "0 14 * * 4"   # Thursday 22:00 CST
+    # Run every Sunday at 02:00 UTC
+    - cron: "0 2 * * 0"
   workflow_dispatch:
     inputs:
       max_repos:
-        description: "Max repos to crawl"
+        description: "Max GitHub repos to crawl"
+        required: false
         default: "5000"
       min_stars:
-        description: "Min stars filter"
+        description: "Minimum stars for GitHub repos"
+        required: false
         default: "10"
+      skip_github:
+        description: "Skip GitHub crawl (true/false)"
+        required: false
+        default: "false"
+      skip_external:
+        description: "Skip external sources crawl (true/false)"
+        required: false
+        default: "false"
 
 jobs:
   crawl:
-    name: Crawl & Score
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Crawl GitHub
-        run: |
-          python scripts/skill_crawler.py crawl \
-            --output /tmp/skills-raw.json \
-            --min-stars ${{ github.event.inputs.min_stars || '10' }} \
-            --max-repos ${{ github.event.inputs.max_repos || '5000' }}
+      # ------------------------------------------------------------------
+      # Step 1: Crawl GitHub (existing behavior)
+      # ------------------------------------------------------------------
+      - name: Crawl GitHub repos
+        if: ${{ github.event.inputs.skip_github != 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/skill_crawler.py crawl \
+            --output scripts/crawler/skills-raw-github.json \
+            --min-stars ${{ github.event.inputs.min_stars || '10' }} \
+            --max-repos ${{ github.event.inputs.max_repos || '5000' }}
 
-      - name: Score & filter
+      - name: Create empty GitHub raw file if skipped
+        if: ${{ github.event.inputs.skip_github == 'true' }}
+        run: |
+          mkdir -p scripts/crawler
+          echo "[]" > scripts/crawler/skills-raw-github.json
+
+      # ------------------------------------------------------------------
+      # Step 2: Crawl external sources (LobeHub, MCP Official, npm, Smithery)
+      # ------------------------------------------------------------------
+      - name: Crawl external sources
+        if: ${{ github.event.inputs.skip_external != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/skill_crawler.py crawl-external \
+            --output scripts/crawler/skills-raw-external.json
+
+      - name: Create empty external raw file if skipped
+        if: ${{ github.event.inputs.skip_external == 'true' }}
+        run: |
+          mkdir -p scripts/crawler
+          echo "[]" > scripts/crawler/skills-raw-external.json
+
+      # ------------------------------------------------------------------
+      # Step 3: Merge GitHub + external results into one file
+      # ------------------------------------------------------------------
+      - name: Merge GitHub and external results
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          github_file  = "scripts/crawler/skills-raw-github.json"
+          external_file = "scripts/crawler/skills-raw-external.json"
+          merged_file  = "scripts/crawler/skills-raw.json"
+
+          os.makedirs("scripts/crawler", exist_ok=True)
+
+          github_skills = []
+          if os.path.exists(github_file):
+              with open(github_file) as f:
+                  github_skills = json.load(f)
+
+          external_skills = []
+          if os.path.exists(external_file):
+              with open(external_file) as f:
+                  external_skills = json.load(f)
+
+          # Merge, dedup by id (GitHub wins on collision since it comes first)
+          seen_ids = set()
+          merged = []
+          for skill in github_skills + external_skills:
+              if skill.get("id") and skill["id"] not in seen_ids:
+                  seen_ids.add(skill["id"])
+                  merged.append(skill)
+
+          with open(merged_file, "w") as f:
+              json.dump(merged, f, indent=2, ensure_ascii=False)
+
+          print(f"Merged: {len(github_skills)} GitHub + {len(external_skills)} external = {len(merged)} unique skills")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # Step 4: Score merged results
+      # ------------------------------------------------------------------
+      - name: Score skills
         run: |
           python scripts/skill_crawler.py score \
-            --input  /tmp/skills-raw.json \
-            --output /tmp/skills-scored.json
+            --input  scripts/crawler/skills-raw.json \
+            --output scripts/crawler/skills-scored.json
 
-      - name: Deduplicate
+      # ------------------------------------------------------------------
+      # Step 5: Deduplicate
+      # ------------------------------------------------------------------
+      - name: Deduplicate skills
         run: |
           python scripts/skill_crawler.py dedup \
-            --input  /tmp/skills-scored.json \
-            --output /tmp/skills-deduped.json
+            --input  scripts/crawler/skills-scored.json \
+            --output scripts/crawler/skills-deduped.json
 
-      - name: Print summary
-        id: summary
-        run: |
-          RAW=$(python3 -c "import json; print(len(json.load(open('/tmp/skills-raw.json'))))")
-          SCORED=$(python3 -c "import json; print(len(json.load(open('/tmp/skills-scored.json'))))")
-          DEDUPED=$(python3 -c "import json; print(len(json.load(open('/tmp/skills-deduped.json'))))")
-          echo "raw=$RAW" >> $GITHUB_OUTPUT
-          echo "scored=$SCORED" >> $GITHUB_OUTPUT
-          echo "deduped=$DEDUPED" >> $GITHUB_OUTPUT
-          echo "## Crawler Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Stage | Count |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Crawled (raw) | $RAW |" >> $GITHUB_STEP_SUMMARY
-          echo "| After scoring (≥45) | $SCORED |" >> $GITHUB_STEP_SUMMARY
-          echo "| After dedup | $DEDUPED |" >> $GITHUB_STEP_SUMMARY
-
-      - name: Open PR to skills-data
-        run: |
-          # Clone skills-data
-          git clone https://x-access-token:${{ secrets.SKILLS_DATA_TOKEN }}@github.com/servagent-ai/skills-data.git /tmp/skills-data-repo
-
-          # Copy new data
-          cp /tmp/skills-deduped.json /tmp/skills-data-repo/data/skills-latest.json
-
-          # Merge latest into main skills.json (union by id, keep highest quality_score)
-          python3 - <<'EOF'
-          import json
-          from pathlib import Path
-
-          existing = json.load(open('/tmp/skills-data-repo/data/skills.json'))
-          latest   = json.load(open('/tmp/skills-deduped.json'))
-
-          by_id = {s['id']: s for s in existing}
-          added = 0
-          for skill in latest:
-              sid = skill['id']
-              if sid not in by_id or skill.get('quality_score', 0) > by_id[sid].get('quality_score', 0):
-                  if sid not in by_id:
-                      added += 1
-                  by_id[sid] = skill
-
-          merged = sorted(by_id.values(), key=lambda s: s.get('quality_score', 0), reverse=True)
-          json.dump(merged, open('/tmp/skills-data-repo/data/skills.json', 'w'), ensure_ascii=False, indent=2)
-          print(f"Merged: {len(existing)} existing + {added} new = {len(merged)} total")
-          EOF
-
-          # Commit and push branch
-          cd /tmp/skills-data-repo
-          git config user.name "servagent-crawler[bot]"
-          git config user.email "crawler@servagent.ai"
-          BRANCH="crawler/$(date +%Y-%m-%d)"
-          git checkout -b $BRANCH
-          git add data/
-          git diff --cached --stat
-          git commit -m "crawler: weekly update $(date +%Y-%m-%d) — ${{ steps.summary.outputs.deduped }} skills"
-          git push origin $BRANCH
-
-          # Open PR via gh
-          gh pr create \
-            --repo servagent-ai/skills-data \
-            --head $BRANCH \
-            --base main \
-            --title "crawler: weekly update $(date +%Y-%m-%d)" \
-            --body "## Weekly Crawler Update
-
-          | Stage | Count |
-          |-------|-------|
-          | Crawled (raw) | ${{ steps.summary.outputs.raw }} |
-          | After scoring | ${{ steps.summary.outputs.scored }} |
-          | After dedup | ${{ steps.summary.outputs.deduped }} |
-
-          Merge this PR to deploy updated skills to production.
-
-          🤖 Auto-generated by [crawler workflow](https://github.com/servagent-ai/crawler/actions)"
+      # ------------------------------------------------------------------
+      # Step 6: Upload to ServAgent API
+      # ------------------------------------------------------------------
+      - name: Upload to ServAgent API
         env:
-          GH_TOKEN: ${{ secrets.SKILLS_DATA_TOKEN }}
+          SERVAGENT_API_KEY: ${{ secrets.SERVAGENT_API_KEY }}
+        run: |
+          python scripts/skill_crawler.py upload \
+            --input   scripts/crawler/skills-deduped.json \
+            --api-url https://api.servagent.ai \
+            --api-key "$SERVAGENT_API_KEY"
+
+      # ------------------------------------------------------------------
+      # Step 7: Commit updated skill files back to repo (optional artifact)
+      # ------------------------------------------------------------------
+      - name: Commit crawler output
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scripts/crawler/skills-raw.json \
+                  scripts/crawler/skills-raw-github.json \
+                  scripts/crawler/skills-raw-external.json \
+                  scripts/crawler/skills-scored.json \
+                  scripts/crawler/skills-deduped.json || true
+          git diff --cached --quiet && echo "No changes to commit" || \
+            git commit -m "chore: update crawled skills [$(date -u +%Y-%m-%d)]"
+          git push || echo "Push failed (may need write permissions)"

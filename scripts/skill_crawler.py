@@ -11,6 +11,7 @@ Usage:
     python skill_crawler.py --max-repos 5000 --min-stars 10 --output skills-raw.json
     python skill_crawler.py --score --input skills-raw.json --output skills-scored.json
     python skill_crawler.py --upload --input skills-scored.json --api-url https://api.servagent.ai
+    python skill_crawler.py crawl-external --output skills-external.json
 """
 
 import os
@@ -236,6 +237,15 @@ def detect_category(repo: dict) -> str:
     return "general"
 
 
+def detect_category_from_text(name: str, desc: str, tags: list[str] = []) -> str:
+    """Detect category from raw text fields (for non-GitHub sources)."""
+    text = f"{name.lower()} {desc.lower()} {' '.join(t.lower() for t in tags)}"
+    for cat, keywords in CATEGORY_MAP.items():
+        if any(k in text for k in keywords):
+            return cat
+    return "general"
+
+
 def detect_protocols(repo: dict) -> list[str]:
     topics = [t.lower() for t in repo.get("topics", [])]
     desc = (repo.get("description") or "").lower()
@@ -251,115 +261,6 @@ def detect_protocols(repo: dict) -> list[str]:
     if not protocols:
         protocols = ["openai-functions"]  # default assumption
     return protocols
-
-
-def fetch_readme_params(owner: str, repo: str) -> list[dict]:
-    """
-    Fetch README and extract parameter definitions.
-    Returns list of {"name", "type", "description", "required"} dicts (max 20).
-    """
-    data = gh_request(f"/repos/{owner}/{repo}/readme")
-    content_b64 = data.get("content", "")
-    if not content_b64:
-        return []
-
-    try:
-        readme = base64.b64decode(content_b64).decode("utf-8", errors="replace")
-    except Exception:
-        return []
-
-    params: list[dict] = []
-    seen: set[str] = set()
-
-    def add_param(name: str, ptype: str, desc: str, required: bool) -> None:
-        key = name.lower().strip()
-        if not key or key in seen or len(params) >= 20:
-            return
-        # Skip generic/noise tokens
-        noise = {"name", "type", "description", "required", "default", "example", "value", "option"}
-        if key in noise or len(key) < 2 or len(key) > 60:
-            return
-        seen.add(key)
-        params.append({
-            "name": name.strip(),
-            "type": ptype or "string",
-            "description": desc.strip()[:200],
-            "required": required,
-        })
-
-    # ── Strategy 1: Markdown parameter/config tables ──────────────────────
-    # Matches tables whose header contains param-like words
-    PARAM_HEADERS = re.compile(
-        r"param|argument|arg|option|flag|env|variable|input|field|key|prop",
-        re.IGNORECASE,
-    )
-    # Find all markdown tables (header row + separator + data rows)
-    table_re = re.compile(
-        r"(\|[^\n]+\|)\n\|[-| :]+\|\n((?:\|[^\n]+\|\n?)+)",
-        re.MULTILINE,
-    )
-    for table_match in table_re.finditer(readme):
-        header_row = table_match.group(1)
-        if not PARAM_HEADERS.search(header_row):
-            continue
-        # Parse header columns
-        cols = [c.strip().lower() for c in header_row.strip("|").split("|")]
-        # Map column indices
-        name_idx = next((i for i, c in enumerate(cols) if c in ("name", "param", "parameter", "argument", "arg", "option", "field", "key", "property")), 0)
-        type_idx = next((i for i, c in enumerate(cols) if "type" in c), -1)
-        desc_idx = next((i for i, c in enumerate(cols) if any(w in c for w in ("desc", "detail", "about", "info", "explain"))), -1)
-        req_idx  = next((i for i, c in enumerate(cols) if "req" in c or "mandator" in c or "optional" in c), -1)
-
-        for data_row in table_match.group(2).strip().splitlines():
-            cells = [c.strip() for c in data_row.strip("|").split("|")]
-            if len(cells) <= name_idx:
-                continue
-            raw_name = re.sub(r"[`*_\[\]()]", "", cells[name_idx]).strip()
-            if not raw_name:
-                continue
-            ptype = cells[type_idx].strip("`* ") if type_idx >= 0 and type_idx < len(cells) else "string"
-            desc  = re.sub(r"<[^>]+>", "", cells[desc_idx]) if desc_idx >= 0 and desc_idx < len(cells) else ""
-            req_cell = cells[req_idx].lower() if req_idx >= 0 and req_idx < len(cells) else ""
-            required = any(w in req_cell for w in ("yes", "true", "required", "✓", "✔"))
-            add_param(raw_name, ptype or "string", desc, required)
-
-    # ── Strategy 2: ENV variable bullet lists ────────────────────────────
-    # Matches: - `ENV_NAME` or - ENV_NAME: description  (or **)
-    env_re = re.compile(
-        r"[-*]\s+[`*]{0,2}([A-Z][A-Z0-9_]{2,})[`*]{0,2}\s*[:\-–]\s*(.{5,150})",
-        re.MULTILINE,
-    )
-    for m in env_re.finditer(readme):
-        name = m.group(1)
-        desc = m.group(2).strip().rstrip(".")
-        required = any(w in desc.lower() for w in ("required", "must", "mandatory"))
-        add_param(name, "string", desc, required)
-
-    # ── Strategy 3: JSON schema "properties" blocks ───────────────────────
-    json_block_re = re.compile(r"```(?:json|jsonc)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
-    for m in json_block_re.finditer(readme):
-        try:
-            obj = json.loads(m.group(1))
-        except Exception:
-            continue
-        props = obj.get("properties") or (obj.get("input_schema") or {}).get("properties") or {}
-        required_list = obj.get("required", [])
-        for pname, pdef in props.items():
-            if not isinstance(pdef, dict):
-                continue
-            ptype = pdef.get("type", "string")
-            desc  = pdef.get("description", "")
-            add_param(pname, ptype, desc, pname in required_list)
-
-    # ── Strategy 4: --flag style parameter listings ───────────────────────
-    flag_re = re.compile(
-        r"--([a-z][a-z0-9_-]{1,30})\s+[<\[`]?([a-z_]+)[>\]`]?\s+[:\-–]\s+(.{5,120})",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    for m in flag_re.finditer(readme):
-        add_param(m.group(1), m.group(2).lower(), m.group(3).strip(), False)
-
-    return params
 
 
 def repo_to_skill(repo: dict) -> dict:
@@ -387,7 +288,7 @@ def repo_to_skill(repo: dict) -> dict:
             "url": html_url,
             "verified": False,
         },
-        "parameters": fetch_readme_params(owner, name) if stars >= 20 else [],
+        "parameters": [],  # populated later by deeper analysis
         "pricing": {"model": "free"},
         "endpoints": {
             "base": homepage or html_url,
@@ -534,12 +435,787 @@ def upload_to_api(skills: list[dict], api_url: str, api_key: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# External Source Helpers
+# ---------------------------------------------------------------------------
+
+def http_get_json(url: str, headers: dict = {}) -> Optional[dict]:
+    """Perform a plain HTTP GET and return parsed JSON, or None on error."""
+    default_headers = {"User-Agent": "ServAgent-Crawler/1.0"}
+    default_headers.update(headers)
+    req = urllib.request.Request(url, headers=default_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"  [http_get_json error] {url}: {e}")
+        return None
+
+
+def http_get_text(url: str, headers: dict = {}) -> Optional[str]:
+    """Perform a plain HTTP GET and return response text, or None on error."""
+    default_headers = {"User-Agent": "ServAgent-Crawler/1.0"}
+    default_headers.update(headers)
+    req = urllib.request.Request(url, headers=default_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            # Try UTF-8, fall back to latin-1
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return raw.decode("latin-1")
+    except Exception as e:
+        print(f"  [http_get_text error] {url}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Source A: LobeHub MCP Marketplace
+# ---------------------------------------------------------------------------
+
+def crawl_lobehub() -> list[dict]:
+    """
+    Crawl LobeHub MCP marketplace.
+    Primary: paginated JSON API at https://lobehub.com/api/mcp/list
+    Fallback: scrape https://lobehub.com/mcp HTML pages (parse JSON embedded in __NEXT_DATA__)
+    """
+    print("\n[LobeHub] Starting crawl...")
+    skills: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # --- Primary: JSON API ---
+    api_success = False
+    page = 1
+    while True:
+        url = f"https://lobehub.com/api/mcp/list?page={page}&pageSize=100"
+        print(f"  [LobeHub API] page {page}: {url}")
+        data = http_get_json(url)
+        if not data:
+            print("  [LobeHub API] No response, switching to scrape fallback")
+            break
+
+        # Try common response envelope shapes
+        items = (
+            data.get("data")
+            or data.get("items")
+            or data.get("list")
+            or data.get("results")
+            or (data if isinstance(data, list) else None)
+        )
+
+        if items is None:
+            print(f"  [LobeHub API] Unexpected shape: {list(data.keys())[:5]}")
+            break
+
+        if not items:
+            print(f"  [LobeHub API] Empty page {page}, done")
+            api_success = True
+            break
+
+        for item in items:
+            skill = _lobehub_item_to_skill(item)
+            if skill and skill["id"] not in seen_ids:
+                seen_ids.add(skill["id"])
+                skills.append(skill)
+
+        print(f"  [LobeHub API] page {page}: +{len(items)} items (total so far: {len(skills)})")
+
+        # Check pagination metadata
+        total = data.get("total") or data.get("totalCount") or data.get("count")
+        if total and len(skills) >= int(total):
+            api_success = True
+            break
+        if len(items) < 100:
+            api_success = True
+            break
+
+        page += 1
+        time.sleep(0.5)
+
+    # --- Fallback: HTML scraping ---
+    if not api_success and not skills:
+        print("  [LobeHub Scrape] Attempting HTML fallback...")
+        skills = _lobehub_scrape_html(seen_ids)
+
+    print(f"[LobeHub] Done: {len(skills)} skills")
+    return skills
+
+
+def _lobehub_item_to_skill(item: dict) -> Optional[dict]:
+    """Convert a LobeHub API item to ServAgent skill format."""
+    raw_id = item.get("identifier") or item.get("id") or item.get("slug") or item.get("name")
+    if not raw_id:
+        return None
+
+    name = item.get("name") or str(raw_id)
+    description = (item.get("description") or f"{name} - MCP tool from LobeHub")[:200]
+    homepage = item.get("homepage") or item.get("url") or item.get("repositoryUrl") or ""
+    provider_name = (
+        item.get("author")
+        or item.get("authorName")
+        or item.get("provider")
+        or "lobehub"
+    )
+    if isinstance(provider_name, dict):
+        provider_name = provider_name.get("name") or "lobehub"
+
+    skill_id = f"skill-lh-{hashlib.md5(str(raw_id).encode()).hexdigest()[:8]}"
+    tags = item.get("tags") or item.get("keywords") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    category = detect_category_from_text(name, description, tags)
+
+    # Try to parse github info if homepage looks like a GitHub URL
+    github_info = _extract_github_info(homepage)
+
+    return {
+        "id": skill_id,
+        "name": name,
+        "description": description,
+        "version": "1.0.0",
+        "category": category,
+        "tags": tags[:10],
+        "provider": {
+            "name": str(provider_name),
+            "url": homepage,
+            "verified": False,
+        },
+        "parameters": [],
+        "pricing": {"model": "free"},
+        "endpoints": {
+            "base": homepage,
+            "docs": homepage,
+        },
+        "protocols": ["mcp"],
+        "source": "lobehub",
+        "github": github_info,
+        "createdAt": item.get("createdAt") or "2024-01-01T00:00:00Z",
+        "updatedAt": item.get("updatedAt") or "2024-01-01T00:00:00Z",
+        "quality_score": 0,
+    }
+
+
+def _lobehub_scrape_html(seen_ids: set) -> list[dict]:
+    """Scrape LobeHub MCP page HTML, extracting __NEXT_DATA__ JSON payload."""
+    skills = []
+    page = 1
+    while page <= 20:  # cap at 20 pages to avoid infinite loops
+        url = f"https://lobehub.com/mcp?page={page}"
+        print(f"  [LobeHub Scrape] {url}")
+        html = http_get_text(url)
+        if not html:
+            break
+
+        # Extract __NEXT_DATA__ JSON embedded in Next.js pages
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+        if not match:
+            print("  [LobeHub Scrape] No __NEXT_DATA__ found")
+            break
+
+        try:
+            next_data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            print("  [LobeHub Scrape] Failed to parse __NEXT_DATA__")
+            break
+
+        # Traverse the Next.js page props to find items
+        props = next_data.get("props", {})
+        page_props = props.get("pageProps", {})
+
+        # Try common data keys
+        items = (
+            page_props.get("mcpList")
+            or page_props.get("items")
+            or page_props.get("servers")
+            or page_props.get("data")
+            or []
+        )
+
+        if not items:
+            print(f"  [LobeHub Scrape] No items found in page {page}")
+            break
+
+        for item in items:
+            skill = _lobehub_item_to_skill(item)
+            if skill and skill["id"] not in seen_ids:
+                seen_ids.add(skill["id"])
+                skills.append(skill)
+
+        print(f"  [LobeHub Scrape] page {page}: +{len(items)} (total: {len(skills)})")
+        if len(items) < 20:
+            break
+        page += 1
+        time.sleep(1)
+
+    return skills
+
+
+# ---------------------------------------------------------------------------
+# Source B: Official modelcontextprotocol/servers README
+# ---------------------------------------------------------------------------
+
+def crawl_mcp_official() -> list[dict]:
+    """
+    Crawl official modelcontextprotocol/servers GitHub repo.
+    Fetches README.md, parses tool names + GitHub links,
+    then optionally fetches each repo for star counts.
+    """
+    print("\n[MCP Official] Starting crawl...")
+    skills: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Fetch README via GitHub API
+    data = gh_request("/repos/modelcontextprotocol/servers/contents/README.md")
+    if not data or "content" not in data:
+        print("  [MCP Official] Failed to fetch README.md")
+        return skills
+
+    # Decode base64 content
+    try:
+        readme_text = base64.b64decode(data["content"]).decode("utf-8")
+    except Exception as e:
+        print(f"  [MCP Official] Failed to decode README: {e}")
+        return skills
+
+    print(f"  [MCP Official] README fetched ({len(readme_text)} chars)")
+
+    # Parse markdown for GitHub links: [name](https://github.com/owner/repo)
+    # Pattern covers links in table rows and list items
+    github_link_pattern = re.compile(
+        r'\[([^\]]+)\]\(https://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)(?:/[^\)]*)?\)'
+    )
+
+    found_repos: dict[str, tuple[str, str, str]] = {}  # "owner/repo" -> (display_name, owner, repo)
+    for m in github_link_pattern.finditer(readme_text):
+        display_name = m.group(1).strip()
+        owner = m.group(2).strip()
+        repo = m.group(3).strip()
+        key = f"{owner}/{repo}"
+        if key not in found_repos:
+            found_repos[key] = (display_name, owner, repo)
+
+    print(f"  [MCP Official] Found {len(found_repos)} GitHub links in README")
+
+    for key, (display_name, owner, repo) in found_repos.items():
+        # Fetch repo metadata from GitHub API for stars, description, etc.
+        repo_data = gh_request(f"/repos/{owner}/{repo}")
+        time.sleep(0.3)  # avoid hitting rate limits
+
+        if repo_data and "id" in repo_data:
+            skill = repo_to_skill(repo_data)
+            # Override source to indicate official curation
+            skill["source"] = "github-official"
+            # Prefer the display name from the README if more descriptive
+            if display_name and len(display_name) > len(skill["name"]):
+                skill["description"] = f"{display_name}: {skill['description']}"[:200]
+        else:
+            # Minimal skill with just the GitHub URL
+            skill_id = f"skill-gh-{hashlib.md5(key.encode()).hexdigest()[:8]}"
+            if skill_id in seen_ids:
+                continue
+            html_url = f"https://github.com/{owner}/{repo}"
+            description = f"{display_name} - Official MCP server"
+            skill = {
+                "id": skill_id,
+                "name": repo,
+                "description": description[:200],
+                "version": "1.0.0",
+                "category": detect_category_from_text(repo, description),
+                "tags": [],
+                "provider": {
+                    "name": owner,
+                    "url": html_url,
+                    "verified": True,  # from official repo
+                },
+                "parameters": [],
+                "pricing": {"model": "free"},
+                "endpoints": {"base": html_url, "docs": html_url},
+                "protocols": ["mcp"],
+                "source": "github-official",
+                "github": {
+                    "owner": owner,
+                    "repo": repo,
+                    "stars": 0,
+                    "url": html_url,
+                    "updated_at": "2024-01-01T00:00:00Z",
+                    "topics": [],
+                    "language": "",
+                    "license": "unknown",
+                },
+                "createdAt": "2024-01-01T00:00:00Z",
+                "updatedAt": "2024-01-01T00:00:00Z",
+                "quality_score": 0,
+            }
+
+        if skill["id"] not in seen_ids:
+            seen_ids.add(skill["id"])
+            skills.append(skill)
+
+    print(f"[MCP Official] Done: {len(skills)} skills")
+    return skills
+
+
+# ---------------------------------------------------------------------------
+# Source C: npm @modelcontextprotocol packages
+# ---------------------------------------------------------------------------
+
+def crawl_npm() -> list[dict]:
+    """
+    Crawl npm registry for MCP-related packages.
+    Searches for @modelcontextprotocol scope and mcp-server keyword.
+    """
+    print("\n[npm] Starting crawl...")
+    skills: list[dict] = []
+    seen_ids: set[str] = set()
+
+    npm_queries = [
+        ("@modelcontextprotocol", 100),
+        ("mcp-server", 200),
+        ("modelcontextprotocol server", 100),
+        ("mcp tool server", 100),
+    ]
+
+    for query_text, size in npm_queries:
+        url = f"https://registry.npmjs.org/-/v1/search?text={urllib.parse.quote(query_text)}&size={size}"
+        print(f"  [npm] Query: {query_text!r}")
+        data = http_get_json(url)
+        if not data:
+            print(f"  [npm] No response for {query_text!r}")
+            continue
+
+        objects = data.get("objects") or []
+        print(f"  [npm] Got {len(objects)} results (total: {data.get('total', '?')})")
+
+        for obj in objects:
+            pkg = obj.get("package") or {}
+            skill = _npm_pkg_to_skill(pkg)
+            if skill and skill["id"] not in seen_ids:
+                seen_ids.add(skill["id"])
+                skills.append(skill)
+
+        time.sleep(0.5)
+
+    print(f"[npm] Done: {len(skills)} unique skills")
+    return skills
+
+
+def _npm_pkg_to_skill(pkg: dict) -> Optional[dict]:
+    """Convert an npm package object to ServAgent skill format."""
+    name = pkg.get("name") or ""
+    if not name:
+        return None
+
+    description = (pkg.get("description") or f"{name} - npm package")[:200]
+    version = pkg.get("version") or "1.0.0"
+    keywords = pkg.get("keywords") or []
+
+    # Filter: must look like an MCP/AI tool
+    combined_text = f"{name} {description} {' '.join(keywords)}".lower()
+    mcp_signals = ["mcp", "modelcontextprotocol", "model-context-protocol", "mcp-server", "claude", "ai-tool"]
+    if not any(sig in combined_text for sig in mcp_signals):
+        return None
+
+    # Links
+    links = pkg.get("links") or {}
+    homepage = links.get("homepage") or links.get("repository") or links.get("npm") or ""
+    npm_url = links.get("npm") or f"https://www.npmjs.com/package/{urllib.parse.quote(name)}"
+
+    # Publisher
+    publisher = pkg.get("publisher") or {}
+    provider_name = publisher.get("username") or publisher.get("name") or "npm"
+
+    skill_id = f"skill-npm-{hashlib.md5(name.encode()).hexdigest()[:8]}"
+    category = detect_category_from_text(name, description, keywords)
+
+    # Try to extract GitHub info from links
+    github_info = _extract_github_info(
+        links.get("repository") or homepage or ""
+    )
+
+    # Dates
+    date_info = pkg.get("date") or {}
+    if isinstance(date_info, str):
+        updated_at = date_info
+    elif isinstance(date_info, dict):
+        updated_at = date_info.get("modified") or date_info.get("created") or "2024-01-01T00:00:00Z"
+    else:
+        updated_at = "2024-01-01T00:00:00Z"
+
+    return {
+        "id": skill_id,
+        "name": name,
+        "description": description,
+        "version": version,
+        "category": category,
+        "tags": keywords[:10],
+        "provider": {
+            "name": provider_name,
+            "url": homepage or npm_url,
+            "verified": False,
+        },
+        "parameters": [],
+        "pricing": {"model": "free"},
+        "endpoints": {
+            "base": homepage or npm_url,
+            "docs": npm_url,
+        },
+        "protocols": ["mcp"],
+        "source": "npm",
+        "github": github_info,
+        "createdAt": updated_at,
+        "updatedAt": updated_at,
+        "quality_score": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source D: Smithery
+# ---------------------------------------------------------------------------
+
+def crawl_smithery() -> list[dict]:
+    """
+    Crawl Smithery MCP server registry.
+    Tries JSON API first, then falls back to HTML scraping.
+    """
+    print("\n[Smithery] Starting crawl...")
+    skills: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # --- Primary: JSON API ---
+    api_endpoints = [
+        "https://smithery.ai/api/servers",
+        "https://smithery.ai/api/v1/servers",
+        "https://smithery.ai/api/mcp/servers",
+    ]
+
+    api_success = False
+    for api_url in api_endpoints:
+        print(f"  [Smithery API] Trying {api_url}")
+        data = http_get_json(api_url)
+        if not data:
+            continue
+
+        # Handle various response shapes
+        items = (
+            data.get("servers")
+            or data.get("items")
+            or data.get("data")
+            or data.get("results")
+            or (data if isinstance(data, list) else None)
+        )
+
+        if not items:
+            print(f"  [Smithery API] Unexpected shape: {list(data.keys())[:5] if isinstance(data, dict) else type(data)}")
+            continue
+
+        for item in items:
+            skill = _smithery_item_to_skill(item)
+            if skill and skill["id"] not in seen_ids:
+                seen_ids.add(skill["id"])
+                skills.append(skill)
+
+        print(f"  [Smithery API] Got {len(skills)} skills from {api_url}")
+        api_success = True
+
+        # Handle pagination if present
+        page = 2
+        while True:
+            paged_url = f"{api_url}?page={page}&pageSize=100"
+            pdata = http_get_json(paged_url)
+            if not pdata:
+                break
+            pitems = (
+                pdata.get("servers")
+                or pdata.get("items")
+                or pdata.get("data")
+                or pdata.get("results")
+                or (pdata if isinstance(pdata, list) else [])
+            )
+            if not pitems:
+                break
+            for item in pitems:
+                skill = _smithery_item_to_skill(item)
+                if skill and skill["id"] not in seen_ids:
+                    seen_ids.add(skill["id"])
+                    skills.append(skill)
+            print(f"  [Smithery API] page {page}: +{len(pitems)} (total: {len(skills)})")
+            if len(pitems) < 50:
+                break
+            page += 1
+            time.sleep(0.5)
+
+        break  # stop trying other endpoints if one worked
+
+    # --- Fallback: HTML scraping ---
+    if not api_success:
+        print("  [Smithery Scrape] API unavailable, attempting HTML scrape...")
+        skills = _smithery_scrape_html(seen_ids)
+
+    print(f"[Smithery] Done: {len(skills)} skills")
+    return skills
+
+
+def _smithery_item_to_skill(item: dict) -> Optional[dict]:
+    """Convert a Smithery server item to ServAgent skill format."""
+    raw_id = item.get("id") or item.get("slug") or item.get("qualifiedName") or item.get("name")
+    if not raw_id:
+        return None
+
+    name = item.get("displayName") or item.get("name") or str(raw_id)
+    description = (item.get("description") or f"{name} - MCP server from Smithery")[:200]
+    homepage = (
+        item.get("homepage")
+        or item.get("url")
+        or item.get("repository")
+        or item.get("githubUrl")
+        or f"https://smithery.ai/server/{urllib.parse.quote(str(raw_id))}"
+    )
+
+    provider_info = item.get("owner") or item.get("author") or {}
+    if isinstance(provider_info, dict):
+        provider_name = provider_info.get("name") or provider_info.get("login") or "smithery"
+    else:
+        provider_name = str(provider_info) or "smithery"
+
+    skill_id = f"skill-sm-{hashlib.md5(str(raw_id).encode()).hexdigest()[:8]}"
+    tags = item.get("tags") or item.get("keywords") or item.get("categories") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    category = detect_category_from_text(name, description, tags)
+    github_info = _extract_github_info(homepage)
+
+    # Stars from Smithery data if available
+    stars = item.get("stars") or item.get("githubStars") or 0
+
+    return {
+        "id": skill_id,
+        "name": name,
+        "description": description,
+        "version": "1.0.0",
+        "category": category,
+        "tags": tags[:10],
+        "provider": {
+            "name": provider_name,
+            "url": homepage,
+            "verified": False,
+        },
+        "parameters": [],
+        "pricing": {"model": "free"},
+        "endpoints": {
+            "base": homepage,
+            "docs": homepage,
+        },
+        "protocols": ["mcp"],
+        "source": "smithery",
+        "github": github_info or {
+            "owner": "",
+            "repo": "",
+            "stars": stars,
+            "url": "",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "topics": [],
+            "language": "",
+            "license": "unknown",
+        },
+        "createdAt": item.get("createdAt") or "2024-01-01T00:00:00Z",
+        "updatedAt": item.get("updatedAt") or "2024-01-01T00:00:00Z",
+        "quality_score": 0,
+    }
+
+
+def _smithery_scrape_html(seen_ids: set) -> list[dict]:
+    """Scrape Smithery HTML pages for MCP server listings."""
+    skills = []
+    page = 1
+    while page <= 20:
+        url = f"https://smithery.ai/?page={page}" if page > 1 else "https://smithery.ai/"
+        print(f"  [Smithery Scrape] {url}")
+        html = http_get_text(url)
+        if not html:
+            break
+
+        # Try to extract __NEXT_DATA__ (Next.js) or similar embedded JSON
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+        if match:
+            try:
+                next_data = json.loads(match.group(1))
+                props = next_data.get("props", {})
+                page_props = props.get("pageProps", {})
+                items = (
+                    page_props.get("servers")
+                    or page_props.get("items")
+                    or page_props.get("data")
+                    or []
+                )
+                if items:
+                    for item in items:
+                        skill = _smithery_item_to_skill(item)
+                        if skill and skill["id"] not in seen_ids:
+                            seen_ids.add(skill["id"])
+                            skills.append(skill)
+                    print(f"  [Smithery Scrape] page {page}: +{len(items)} (total: {len(skills)})")
+                    if len(items) < 10:
+                        break
+                    page += 1
+                    time.sleep(1)
+                    continue
+            except Exception:
+                pass
+
+        # Fallback: regex for server names/links in HTML
+        server_links = re.findall(r'href="/server/([^"]+)"', html)
+        if not server_links:
+            print(f"  [Smithery Scrape] No server links found on page {page}")
+            break
+
+        for slug in server_links:
+            skill_id = f"skill-sm-{hashlib.md5(slug.encode()).hexdigest()[:8]}"
+            if skill_id in seen_ids:
+                continue
+            seen_ids.add(skill_id)
+            smithery_url = f"https://smithery.ai/server/{slug}"
+            skills.append({
+                "id": skill_id,
+                "name": slug.replace("-", " ").replace("/", " - "),
+                "description": f"MCP server: {slug}",
+                "version": "1.0.0",
+                "category": detect_category_from_text(slug, ""),
+                "tags": [],
+                "provider": {"name": "smithery", "url": smithery_url, "verified": False},
+                "parameters": [],
+                "pricing": {"model": "free"},
+                "endpoints": {"base": smithery_url, "docs": smithery_url},
+                "protocols": ["mcp"],
+                "source": "smithery",
+                "github": {"owner": "", "repo": "", "stars": 0, "url": "",
+                           "updated_at": "2024-01-01T00:00:00Z",
+                           "topics": [], "language": "", "license": "unknown"},
+                "createdAt": "2024-01-01T00:00:00Z",
+                "updatedAt": "2024-01-01T00:00:00Z",
+                "quality_score": 0,
+            })
+
+        print(f"  [Smithery Scrape] page {page}: +{len(server_links)} (total: {len(skills)})")
+        if len(server_links) < 10:
+            break
+        page += 1
+        time.sleep(1)
+
+    return skills
+
+
+# ---------------------------------------------------------------------------
+# Shared utility: extract GitHub owner/repo from a URL
+# ---------------------------------------------------------------------------
+
+def _extract_github_info(url: str) -> Optional[dict]:
+    """
+    If `url` is a GitHub repository URL, return a minimal github dict.
+    Returns None if the URL is not a GitHub repo URL.
+    """
+    if not url:
+        return None
+    m = re.match(r'https?://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)', url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return {
+        "owner": owner,
+        "repo": repo,
+        "stars": 0,
+        "url": f"https://github.com/{owner}/{repo}",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "topics": [],
+        "language": "",
+        "license": "unknown",
+    }
+
+
+# ---------------------------------------------------------------------------
+# cmd_crawl_external — orchestrates all external sources
+# ---------------------------------------------------------------------------
+
+def cmd_crawl_external(args):
+    """Crawl all external sources (LobeHub, MCP Official, npm, Smithery) and merge results."""
+    print(f"\nStarting external crawl (sources: LobeHub, MCP Official, npm, Smithery)")
+    all_skills: list[dict] = []
+    seen_ids: set[str] = set()
+
+    source_results: dict[str, list[dict]] = {}
+
+    # Source A: LobeHub
+    if not getattr(args, "sources", None) or "lobehub" in args.sources:
+        try:
+            lh_skills = crawl_lobehub()
+            source_results["lobehub"] = lh_skills
+            print(f"  [LobeHub] {len(lh_skills)} skills collected")
+        except Exception as e:
+            print(f"  [LobeHub] ERROR: {e}")
+            source_results["lobehub"] = []
+
+    # Source B: MCP Official
+    if not getattr(args, "sources", None) or "github-official" in args.sources:
+        try:
+            mcp_skills = crawl_mcp_official()
+            source_results["github-official"] = mcp_skills
+            print(f"  [MCP Official] {len(mcp_skills)} skills collected")
+        except Exception as e:
+            print(f"  [MCP Official] ERROR: {e}")
+            source_results["github-official"] = []
+
+    # Source C: npm
+    if not getattr(args, "sources", None) or "npm" in args.sources:
+        try:
+            npm_skills = crawl_npm()
+            source_results["npm"] = npm_skills
+            print(f"  [npm] {len(npm_skills)} skills collected")
+        except Exception as e:
+            print(f"  [npm] ERROR: {e}")
+            source_results["npm"] = []
+
+    # Source D: Smithery
+    if not getattr(args, "sources", None) or "smithery" in args.sources:
+        try:
+            sm_skills = crawl_smithery()
+            source_results["smithery"] = sm_skills
+            print(f"  [Smithery] {len(sm_skills)} skills collected")
+        except Exception as e:
+            print(f"  [Smithery] ERROR: {e}")
+            source_results["smithery"] = []
+
+    # Merge, deduplicate by ID
+    for source_name, source_skills in source_results.items():
+        for skill in source_skills:
+            if skill["id"] not in seen_ids:
+                seen_ids.add(skill["id"])
+                all_skills.append(skill)
+
+    # Score all skills
+    print(f"\nScoring {len(all_skills)} external skills...")
+    all_skills = [score_skill(s) for s in all_skills]
+    all_skills.sort(key=lambda s: s["quality_score"], reverse=True)
+
+    # Print summary
+    print(f"\nExternal crawl summary:")
+    for src, skills in source_results.items():
+        print(f"  {src:<20}: {len(skills):5d} skills")
+    print(f"  {'TOTAL (deduped)':<20}: {len(all_skills):5d} skills")
+
+    # Save output
+    with open(args.output, "w") as f:
+        json.dump(all_skills, f, indent=2, ensure_ascii=False)
+    print(f"\nSaved to {args.output}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def cmd_crawl(args):
     """Crawl GitHub and save raw skill data."""
-    print(f"\n🕷  Starting crawl (token={'yes' if GITHUB_TOKEN else 'NO — rate-limited to 10 req/min'})")
+    print(f"\n  Starting crawl (token={'yes' if GITHUB_TOKEN else 'NO -- rate-limited to 10 req/min'})")
     print(f"   Queries: {len(SEARCH_QUERIES)} | min-stars: {args.min_stars} | max-repos: {args.max_repos}\n")
 
     seen_ids: set[str] = set()
@@ -563,13 +1239,13 @@ def cmd_crawl(args):
             new += 1
             if len(all_skills) >= args.max_repos:
                 break
-        print(f"   → {new} new skills (total: {len(all_skills)})")
+        print(f"   -> {new} new skills (total: {len(all_skills)})")
         if len(all_skills) >= args.max_repos:
             print(f"\n  Reached max-repos={args.max_repos}, stopping crawl.")
             break
         time.sleep(1)
 
-    print(f"\n✅ Crawl complete: {len(all_skills)} unique skills")
+    print(f"\nCrawl complete: {len(all_skills)} unique skills")
     with open(args.output, "w") as f:
         json.dump(all_skills, f, indent=2, ensure_ascii=False)
     print(f"   Saved to {args.output}")
@@ -577,7 +1253,7 @@ def cmd_crawl(args):
 
 def cmd_score(args):
     """Load raw skills, score them, and save."""
-    print(f"\n🏆 Scoring skills from {args.input}...")
+    print(f"\nScoring skills from {args.input}...")
     with open(args.input) as f:
         skills = json.load(f)
 
@@ -588,25 +1264,25 @@ def cmd_score(args):
     medium = [s for s in scored if s["quality_tier"] == "medium"]
     low = [s for s in scored if s["quality_tier"] == "low"]
 
-    print(f"\n📊 Score distribution:")
+    print(f"\nScore distribution:")
     print(f"   High  (65+): {len(high):4d} skills")
     print(f"   Medium(45-64): {len(medium):4d} skills")
-    print(f"   Low   (<45): {len(low):4d} skills — will be excluded")
+    print(f"   Low   (<45): {len(low):4d} skills -- will be excluded")
     print(f"   Total kept: {len(high) + len(medium)}")
 
     kept = high + medium  # filter out low
     with open(args.output, "w") as f:
         json.dump(kept, f, indent=2, ensure_ascii=False)
-    print(f"\n✅ Scored skills saved to {args.output}")
+    print(f"\nScored skills saved to {args.output}")
 
     # Summary stats
     if kept:
         avg = sum(s["quality_score"] for s in kept) / len(kept)
         top10 = kept[:10]
-        print(f"\n🏅 Top 10 skills:")
+        print(f"\nTop 10 skills:")
         for s in top10:
             gh = s.get("github", {})
-            print(f"   {s['quality_score']:3d} ⭐{gh.get('stars',0):5d}  {s['name']:<40} [{s['category']}]")
+            print(f"   {s['quality_score']:3d} stars:{gh.get('stars',0):5d}  {s['name']:<40} [{s['category']}]")
         print(f"\n   Average score: {avg:.1f}")
 
 
@@ -641,17 +1317,17 @@ def _desc_jaccard(a: str, b: str) -> float:
 def dedup_skills(skills: list[dict]) -> tuple[list[dict], dict]:
     """
     Deduplicate skills by functionality. Three strategies (in priority order):
-    1. Same GitHub URL → exact same repo, keep highest quality_score
-    2. Same (norm_name, category) → same tool, different packaging
-    3. Same category + description Jaccard ≥ 0.65 → functionally identical
+    1. Same GitHub URL -> exact same repo, keep highest quality_score
+    2. Same (norm_name, category) -> same tool, different packaging
+    3. Same category + description Jaccard >= 0.65 -> functionally identical
     Returns (deduped_list, stats).
     """
     # Sort descending by quality_score so we always keep the best one first
     skills = sorted(skills, key=lambda s: s.get("quality_score", 0), reverse=True)
 
     kept: list[dict] = []
-    seen_github_url: dict[str, int] = {}   # url → index in kept
-    seen_name_cat: dict[tuple, int] = {}   # (norm_name, category) → index
+    seen_github_url: dict[str, int] = {}   # url -> index in kept
+    seen_name_cat: dict[tuple, int] = {}   # (norm_name, category) -> index
     removed = 0
     reasons: list[str] = []
 
@@ -666,7 +1342,7 @@ def dedup_skills(skills: list[dict]) -> tuple[list[dict], dict]:
             existing = kept[seen_github_url[gh_url]]
             reasons.append(
                 f"github-url | {skill['name']} ({skill.get('quality_score',0)}) "
-                f"→ kept {existing['name']} ({existing.get('quality_score',0)})"
+                f"-> kept {existing['name']} ({existing.get('quality_score',0)})"
             )
             removed += 1
             continue
@@ -677,7 +1353,7 @@ def dedup_skills(skills: list[dict]) -> tuple[list[dict], dict]:
             existing = kept[seen_name_cat[key2]]
             reasons.append(
                 f"name+cat  | {skill['name']} ({skill.get('quality_score',0)}) "
-                f"→ kept {existing['name']} ({existing.get('quality_score',0)})"
+                f"-> kept {existing['name']} ({existing.get('quality_score',0)})"
             )
             removed += 1
             continue
@@ -693,7 +1369,7 @@ def dedup_skills(skills: list[dict]) -> tuple[list[dict], dict]:
                     existing = kept[idx]
                     reasons.append(
                         f"desc-sim  | {skill['name']} ({skill.get('quality_score',0)}) "
-                        f"→ kept {existing['name']} ({existing.get('quality_score',0)})"
+                        f"-> kept {existing['name']} ({existing.get('quality_score',0)})"
                     )
                     removed += 1
                     dup_found = True
@@ -701,7 +1377,7 @@ def dedup_skills(skills: list[dict]) -> tuple[list[dict], dict]:
             if dup_found:
                 continue
 
-        # Not a duplicate — register and keep
+        # Not a duplicate -- register and keep
         idx = len(kept)
         if gh_url:
             seen_github_url[gh_url] = idx
@@ -722,30 +1398,30 @@ def dedup_skills(skills: list[dict]) -> tuple[list[dict], dict]:
 
 def cmd_dedup(args):
     """Deduplicate scored skills by functionality."""
-    print(f"\n🔁 Deduplicating {args.input}...")
+    print(f"\nDeduplicating {args.input}...")
     with open(args.input) as f:
         skills = json.load(f)
 
     deduped, stats = dedup_skills(skills)
 
-    print(f"\n📊 Dedup results:")
+    print(f"\nDedup results:")
     print(f"   Before : {stats['before']:4d} skills")
     print(f"   Removed: {stats['removed']:4d} duplicates")
     print(f"   After  : {stats['after']:4d} skills")
 
     if stats["reasons"]:
-        print(f"\n🗑  Sample removed (showing up to 20):")
+        print(f"\nSample removed (showing up to 20):")
         for r in stats["reasons"][:20]:
             print(f"   {r}")
 
     with open(args.output, "w") as f:
         json.dump(deduped, f, indent=2, ensure_ascii=False)
-    print(f"\n✅ Deduped skills saved to {args.output}")
+    print(f"\nDeduped skills saved to {args.output}")
 
 
 def cmd_upload(args):
     """Upload scored skills to ServAgent API."""
-    print(f"\n☁️  Uploading to {args.api_url}...")
+    print(f"\nUploading to {args.api_url}...")
     with open(args.input) as f:
         skills = json.load(f)
 
@@ -757,12 +1433,12 @@ def cmd_upload(args):
         result = upload_to_api(batch, args.api_url, args.api_key or "")
         if result.get("success"):
             total_uploaded += len(batch)
-            print(f"   Batch {i//batch_size + 1}: ✓ {len(batch)} uploaded")
+            print(f"   Batch {i//batch_size + 1}: ok {len(batch)} uploaded")
         else:
-            print(f"   Batch {i//batch_size + 1}: ✗ {result.get('error')}")
+            print(f"   Batch {i//batch_size + 1}: FAIL {result.get('error')}")
         time.sleep(0.5)
 
-    print(f"\n✅ Upload complete: {total_uploaded}/{len(skills)} skills")
+    print(f"\nUpload complete: {total_uploaded}/{len(skills)} skills")
 
 
 def main():
@@ -775,6 +1451,17 @@ def main():
     p_crawl.add_argument("--min-stars", type=int, default=10)
     p_crawl.add_argument("--max-repos", type=int, default=5000)
     p_crawl.add_argument("--include-forks", action="store_true")
+
+    # crawl-external
+    p_crawl_ext = sub.add_parser("crawl-external", help="Crawl external sources (LobeHub, MCP Official, npm, Smithery)")
+    p_crawl_ext.add_argument("--output", default="scripts/crawler/skills-external.json")
+    p_crawl_ext.add_argument(
+        "--sources",
+        nargs="*",
+        choices=["lobehub", "github-official", "npm", "smithery"],
+        default=None,
+        help="Sources to crawl (default: all). E.g. --sources lobehub npm",
+    )
 
     # score
     p_score = sub.add_parser("score", help="Score and filter skills")
@@ -793,7 +1480,7 @@ def main():
     p_upload.add_argument("--api-key", default="")
 
     # all-in-one
-    p_run = sub.add_parser("run-all", help="Crawl → Score → Upload pipeline")
+    p_run = sub.add_parser("run-all", help="Crawl -> Score -> Upload pipeline")
     p_run.add_argument("--min-stars", type=int, default=10)
     p_run.add_argument("--max-repos", type=int, default=5000)
     p_run.add_argument("--api-url", default="http://localhost:8787")
@@ -804,6 +1491,8 @@ def main():
 
     if args.command == "crawl":
         cmd_crawl(args)
+    elif args.command == "crawl-external":
+        cmd_crawl_external(args)
     elif args.command == "score":
         cmd_score(args)
     elif args.command == "dedup":
